@@ -1,6 +1,6 @@
-# Docs Workspace — 系統規格書
+# Rummage — 系統規格書
 
-> 個人文件知識庫：以 Markdown 文件為核心，結合 AI 自動摘要與標籤、RAG 問答、Tool Calling 代理寫入，並內建可觀測性面板，將 AI 管線的延遲與檢索品質攤開檢視。
+> 個人知識庫：存入的內容由 AI 建立索引，需要時以自然語言檢索與問答。第一版以 Markdown 文件為核心，結合 AI 自動摘要與標籤、RAG 問答、Tool Calling 代理寫入，並內建可觀測性面板，將 AI 管線的延遲與檢索品質攤開檢視。
 
 ## 1. 目標與範圍
 
@@ -17,7 +17,7 @@
 ### 1.2 非目標
 
 - 多人即時協作編輯、文件分享與權限委派。
-- 檔案上傳解析（PDF / DOCX）；內容來源僅限 Markdown 純文字。
+- 檔案上傳解析（PDF / DOCX）。首版內容來源僅限 Markdown 純文字；擴充點為在索引管線（5.3）前段新增「儲存 → 解析為文字」步驟，切塊之後的流程、檢索與問答皆沿用，不需改動。
 - 混合檢索（BM25 + 向量）、Reranker、查詢改寫。
 - 多租戶組織（Organization / Team）模型。
 
@@ -118,7 +118,7 @@ erDiagram
 | `document_chunks using hnsw (embedding vector_cosine_ops)` | 近似最近鄰檢索 |
 | `document_chunks (owner_id)`、`(document_id)` | 擁有者過濾、重建索引時刪除舊片段 |
 | `document_tags (tag_id)` | 依標籤反查文件 |
-| `jobs (run_after) where status = 'queued'` | Worker 取件，partial index 只涵蓋待處理列 |
+| `jobs (run_after) where status = 'queued'` | Worker 領取工作，partial index 只涵蓋待處理列 |
 
 ## 5. 功能規格
 
@@ -156,15 +156,15 @@ sequenceDiagram
   A->>DB: BEGIN; 寫入 documents + 插入 jobs; COMMIT
   A-->>U: 立即回應（status = pending）
   A-)W: 回應後觸發（另有排程補償掃描）
-  W->>DB: 取件（FOR UPDATE SKIP LOCKED）
-  W->>W: 切片
+  W->>DB: 領取工作（FOR UPDATE SKIP LOCKED）
+  W->>W: 切塊
   W->>O: 批次產生 Embedding
   W->>O: 結構化輸出：摘要 + 標籤
   W->>DB: 單一交易：汰換片段、寫入標籤與摘要、status = ready
 ```
 
-- **取件**：`SELECT … FOR UPDATE SKIP LOCKED` 保證多個 Worker 併發時不會重複處理同一工作。
-- **切片**：依 Markdown 標題與段落邊界切分，目標約 500 tokens、重疊約 50 tokens。
+- **領取工作**：`SELECT … FOR UPDATE SKIP LOCKED` 保證多個 Worker 併發時不會重複處理同一工作。
+- **切塊（chunking）**：依 Markdown 標題與段落邊界切分，目標約 500 tokens、重疊約 50 tokens。
 - **結構化輸出**：模型回應必須通過 Schema 驗證 —— `summary`（≤ 300 字）、`tags`（1–5 個，正規化為小寫、去重）。驗證失敗視為該次嘗試失敗。
 - **冪等**：工作攜帶排入當下的 `content_hash`；若與文件現值不符（內容已再次更新）則直接丟棄。
 - **重試**：指數退避，最多 3 次；超過則標記 `failed` 並保留 `last_error`，可由使用者手動重新觸發。
@@ -184,6 +184,21 @@ sequenceDiagram
 
 檢索為生成前的固定步驟而非交由模型決定，使每次回答的檢索結果與相似度都可被記錄與比對。
 
+#### 5.4.1 評估
+
+檢索與生成品質以固定的評估資料集量化，任何影響品質的參數調整都必須以評估結果佐證。
+
+| 類別 | 定義 |
+|------|------|
+| 語料 | 固定的測試文件集，載入獨立的評估用資料庫，不使用正式資料 |
+| 資料集 | 每筆包含：提問、預期命中的來源文件、預期答案要點；涵蓋「語料中查無答案」的案例 |
+| 檢索指標 | Recall@K（預期來源文件出現在 Top-K 的比例）、MRR |
+| 生成指標 | 答案要點覆蓋率、引用正確率、查無資料案例的拒答率；以結構化輸出的評分模型判定，並抽樣人工複核 |
+| 成本指標 | 平均 `ttftMs`、`totalMs`、每題 Token 用量 |
+
+- 觸發時機：調整切塊大小 / 重疊、Top-K、相似度門檻、Embedding 模型、Prompt 時執行；因需呼叫付費 API，不在每次 PR 自動執行。
+- 每次執行的設定與結果以 JSON 輸出並納入版控，以便比較不同設定間的差異。
+
 ### 5.5 Tool Calling：對話中新增文件
 
 | 工具 | 類型 | 輸入 Schema | 執行條件 |
@@ -193,7 +208,7 @@ sequenceDiagram
 - 工具參數由模型產生，視同外部輸入，執行前以 Schema 驗證。
 - 文件擁有者一律取自伺服器端 Session；工具 Schema 不包含任何擁有者欄位。
 - 工具內部呼叫與 UI 相同的 Service 函式，因此同樣會排入摘要與索引工作。
-- 單次請求的代理步數設有上限（預設 5），避免失控迴圈與成本外溢。
+- 單次請求的代理步數設有上限（預設 5），避免無限迴圈與成本失控。
 
 ### 5.6 工程師透視面板
 
@@ -207,9 +222,9 @@ sequenceDiagram
 | 問答 | Token 用量 | 輸入 / 輸出 tokens |
 | 檢索 | 相似度 | 每個命中片段的分數、來源文件、是否通過門檻 |
 | 工具 | 呼叫時間軸 | 工具名稱、耗時、結果狀態 |
-| Worker | 階段耗時 | 佇列等待、切片、Embedding、摘要、寫入；嘗試次數與錯誤訊息 |
+| Worker | 階段耗時 | 佇列等待、切塊、Embedding、摘要、寫入；嘗試次數與錯誤訊息 |
 
-問答指標於串流結束時隨訊息 metadata 送達前端即時呈現，同時落地至 `ai_traces` 供事後查詢。
+問答指標於串流結束時隨訊息 metadata 送達前端即時呈現，同時寫入 `ai_traces` 供事後查詢。
 
 ## 6. 安全設計
 
@@ -246,11 +261,54 @@ sequenceDiagram
 | `ttftMs` p50 | < 1.5 s |
 | 單一文件（約 5,000 字）索引完成時間 | < 15 s |
 
-## 8. 目錄結構
+## 8. 測試策略
+
+| 層級 | 工具 | 範圍 |
+|------|------|------|
+| 單元測試 | Vitest | Zod 契約（合法 / 非法輸入、未宣告欄位剔除）、切塊演算法、純函式 |
+| 整合測試 | Vitest + 本機 Supabase（`supabase start`） | DAL 與 Service 對真實 PostgreSQL 執行；RLS 政策；工作佇列併發領取工作 |
+| 端對端測試 | Playwright | 登入、文件 CRUD、問答串流的關鍵路徑 |
+| 品質評估 | 評估腳本（見 5.4.1） | 檢索與生成品質 |
+
+- **授權測試為必要項**：每個 DAL 函式皆需有跨使用者測試——以使用者 B 的身份操作使用者 A 的資源，斷言讀取回傳查無資料、更新與刪除不影響任何資料列。
+- 整合測試使用真實資料庫而非 mock，因擁有者條件、外鍵、交易與 RLS 的正確性只能在資料庫上驗證。
+- 每個測試以交易包覆並於結束時 rollback，或使用獨立的測試資料，確保測試間互不影響。
+- 模型呼叫在單元與整合測試中以固定回應替換，測試不依賴外部 API。
+
+## 9. 部署
+
+```mermaid
+flowchart LR
+  PR["Pull Request"] --> CI["GitHub Actions<br/>型別檢查 · Lint · 單元 · 整合"]
+  CI --> PV["Vercel Preview<br/>連線 staging 資料庫"]
+  PR -->|merge main| MIG["套用 Migration<br/>（正式資料庫）"]
+  MIG --> PROD["Vercel Production"]
+```
+
+| 類別 | 規範 |
+|------|------|
+| 主機 | Vercel；Server Actions 與 Route Handlers 以 Serverless Functions 執行 |
+| 環境 | Production 與 Preview 使用不同的 Supabase 專案；Preview 不得連線正式資料庫 |
+| Migration | 合併至 `main` 後由 CI 以直連 URL 套用，成功後才進行正式部署；Migration 必須向後相容，使舊版程式在新 Schema 上仍可運作 |
+| 背景工作 | 寫入後於回應送出後觸發 Worker；另以排程定期掃描逾時或待重試的工作作為補償。排程由 Vercel Cron 觸發，若方案的排程頻率不足，改以 Supabase `pg_cron` 呼叫 Worker 端點 |
+| 機密 | 僅存放於 Vercel 與 GitHub 的環境變數設定，不進版控；`.env.example` 只列變數名稱 |
+| 合併條件 | CI 全數通過 |
+
+## 10. 目錄結構
 
 ```
 .
+├── .github/
+│   └── workflows/              # CI：型別檢查、Lint、測試、Migration
 ├── drizzle/                    # SQL migrations（由 drizzle-kit 產生，納入版控）
+├── evals/
+│   ├── fixtures/               # 評估用語料
+│   ├── datasets/               # 提問與預期結果
+│   └── results/                # 各次執行的設定與結果（納入版控）
+├── supabase/                   # 本機 Supabase 設定（整合測試與本機開發）
+├── tests/
+│   ├── integration/            # DAL / Service / RLS，對本機資料庫執行
+│   └── e2e/                    # Playwright
 ├── src/
 │   ├── app/
 │   │   ├── (auth)/             # 登入相關頁面
@@ -279,7 +337,9 @@ sequenceDiagram
 └── CLAUDE.md
 ```
 
-## 9. 環境變數
+單元測試與受測檔案放在同一目錄（`*.test.ts`）。
+
+## 11. 環境變數
 
 | 變數 | 可見範圍 | 用途 |
 |------|----------|------|
